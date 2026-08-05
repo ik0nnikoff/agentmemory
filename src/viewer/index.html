@@ -3681,6 +3681,17 @@
       }
     }
 
+    // Live events arrive per observation, and the PostToolUse hook writes one
+    // per tool call, so an active agent session produces bursts of them. Each
+    // one used to trigger a full loadDashboard(): ten API calls, one of them
+    // memories?latest=true&limit=500, plus a complete re-render. Coalesce the
+    // burst into a single reload. 1500ms stays well under the 30s periodic
+    // refresh, so the dashboard still reads as live.
+    var scheduleDashboardReload = debounce(function() {
+      state.dashboard.loaded = false;
+      loadDashboard();
+    }, 1500);
+
     function routeWsMessage(msg) {
       if (state.activeTab === 'timeline' && msg.observation) {
         if (!state.timeline.sessionId || msg.observation.sessionId === state.timeline.sessionId) {
@@ -3694,8 +3705,7 @@
         }
       }
       if (state.activeTab === 'dashboard') {
-        state.dashboard.loaded = false;
-        loadDashboard();
+        scheduleDashboardReload();
       }
       if (state.activeTab === 'activity' && msg.observation) {
         state.activity.observations.unshift(msg.observation);
