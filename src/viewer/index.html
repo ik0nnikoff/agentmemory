@@ -1366,6 +1366,9 @@
       }
     }
 
+    // Page size requested for dashboard counters whose endpoints report no total.
+    var DASHBOARD_PAGE_CAP = 5000;
+
     async function loadDashboard() {
       var el = document.getElementById('view-dashboard');
       el.innerHTML = '<div class="loading">Loading dashboard...</div>';
@@ -1379,12 +1382,20 @@
           apiGet('semantic'),
           apiGet('procedural'),
           apiGet('relations'),
-          apiGet('lessons'),
-          apiGet('crystals')
+          // Both endpoints page server-side (lessons 50, crystals 20) and return
+          // no total, so the stat cards below were reporting the page size.
+          // Ask for a page large enough that the length is the count.
+          apiGet('lessons?limit=' + DASHBOARD_PAGE_CAP),
+          apiGet('crystals?limit=' + DASHBOARD_PAGE_CAP)
         ]);
         state.dashboard.health = results[0];
         state.dashboard.sessions = (results[1] && results[1].sessions) || [];
         state.dashboard.memories = (results[2] && results[2].memories) || [];
+        // The memories response reports the real count; the array is one capped
+        // page of it. Keep the total so the stat card stops showing the page size.
+        state.dashboard.memoriesTotal = (results[2] && typeof results[2].total === 'number')
+          ? results[2].total
+          : null;
         state.dashboard.graphStats = results[3];
         state.dashboard.recentAudit = (results[4] && results[4].entries) || [];
         state.dashboard.semantic = (results[5] && results[5].facts) || (results[5] && results[5].semantic) || [];
@@ -1443,9 +1454,16 @@
       }
       html += '<div class="stats-grid">';
       html += '<div class="stat-card"><div class="label">Sessions</div><div class="value">' + d.sessions.length + '</div><div class="sub">' + activeSessions + ' active</div></div>';
-      html += '<div class="stat-card"><div class="label">Memories</div><div class="value">' + d.memories.length + '</div><div class="sub">latest versions</div></div>';
+      var memoryCount = (typeof d.memoriesTotal === 'number') ? d.memoriesTotal : d.memories.length;
+      html += '<div class="stat-card"><div class="label">Memories</div><div class="value">' + memoryCount + '</div><div class="sub">latest versions</div></div>';
+      // lessons/crystals report no total, so length is the count only while it
+      // stays under the page we asked for. Say "N+" at the cap instead of
+      // freezing there silently, which is how this card read 50 and 20 against
+      // a store holding 415 and 41.
       var lessonCount = (d.lessons || []).length;
       var crystalCount = (d.crystals || []).length;
+      lessonCount = lessonCount >= DASHBOARD_PAGE_CAP ? lessonCount + '+' : lessonCount;
+      crystalCount = crystalCount >= DASHBOARD_PAGE_CAP ? crystalCount + '+' : crystalCount;
       html += '<div class="stat-card"><div class="label">Lessons</div><div class="value">' + lessonCount + '</div><div class="sub">confidence-scored</div></div>';
       html += '<div class="stat-card"><div class="label">Crystals</div><div class="value">' + crystalCount + '</div><div class="sub">action digests</div></div>';
       html += '<div class="stat-card"><div class="label">Graph Nodes</div><div class="value">' + nodeCount + '</div><div class="sub">' + edgeCount + ' edges</div></div>';
