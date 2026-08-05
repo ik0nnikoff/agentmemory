@@ -1249,19 +1249,33 @@
         var res = await fetch(url, fetchOpts);
         if (!res.ok) {
           if (res.status === 401) showViewerAuthPrompt();
-          console.warn('[viewer] API ' + (fetchOpts.method || 'GET') + ' ' + path + ' returned ' + res.status);
+          // A 503 carrying {error, flag, enableHow} is flagDisabledResponse() or
+          // requireConfiguredSecret() reporting a feature that is switched off —
+          // an answer, not a failure. The dashboard requests graph/stats
+          // unconditionally, so with GRAPH_EXTRACTION_ENABLED=false that logged a
+          // warning on every single reload. Detect it by the body rather than by
+          // the status code, because the health endpoint also answers 503 and
+          // there it means status === "critical", which must stay visible.
+          var errorBody = null;
+          if (readErrorBody || res.status === 503) {
+            try {
+              errorBody = await res.json();
+            } catch (parseErr) {
+              console.debug('[viewer] API ' + path + ' non-2xx body was not JSON:', parseErr);
+              errorBody = null;
+            }
+          }
+          var featureDisabled = res.status === 503 && errorBody && errorBody.flag;
+          if (!featureDisabled) {
+            console.warn('[viewer] API ' + (fetchOpts.method || 'GET') + ' ' + path + ' returned ' + res.status);
+          }
           // Non-2xx responses resolve to null so callers can keep treating
           // null as "request failed" (e.g. loadGraph's disabled/error state).
           // The health endpoint opts out via readErrorBody: it intentionally
           // responds 503 with a valid JSON body when status is "critical"
           // (see #1019), and the dashboard badge needs that body.
           if (!readErrorBody) return null;
-          try {
-            return await res.json();
-          } catch (parseErr) {
-            console.debug('[viewer] API ' + path + ' non-2xx body was not JSON:', parseErr);
-            return null;
-          }
+          return errorBody;
         }
         hideViewerAuthPrompt();
         return await res.json();
