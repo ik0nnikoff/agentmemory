@@ -35,7 +35,7 @@ describe("buildMergedHooks", () => {
     const preToolUse = merged.hooks["PreToolUse"];
     expect(preToolUse).toBeDefined();
     expect(preToolUse!.length).toBeGreaterThan(0);
-    expect(preToolUse![0].matcher).toBe("Edit|Write|Read|Glob|Grep");
+    expect(preToolUse![0].matcher).toBe("Edit|Write");
   });
 
   it("includes all six expected lifecycle events", () => {
