@@ -22,7 +22,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Edit|Create|Read|Glob|Grep",
+        "matcher": "Edit|Create",
         "hooks": [
           {
             "type": "command",

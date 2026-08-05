@@ -22,7 +22,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Edit|Write|Read|Glob|Grep",
+        "matcher": "Edit|Write",
         "hooks": [
           {
             "type": "command",
@@ -33,6 +33,7 @@
     ],
     "PostToolUse": [
       {
+        "matcher": "Edit|Write|MultiEdit|Read|Bash|NotebookEdit",
         "hooks": [
           {
             "type": "command",
