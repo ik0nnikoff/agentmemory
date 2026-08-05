@@ -35,7 +35,15 @@ export function createEmbeddingProvider(): EmbeddingProvider | null {
     case "gemini":
       return withDimensionGuard(new GeminiEmbeddingProvider(getEnvVar("GEMINI_API_KEY")!));
     case "openai":
-      return withDimensionGuard(new OpenAIEmbeddingProvider(getEnvVar("OPENAI_API_KEY")!));
+      // No explicit key here: OpenAIEmbeddingProvider already resolves
+      // OPENAI_EMBEDDING_API_KEY -> OPENAI_API_KEY, and a caller-passed key wins
+      // over both. Passing OPENAI_API_KEY defeated OPENAI_EMBEDDING_API_KEY
+      // entirely, which breaks the documented split where chat runs against an
+      // OpenAI-compatible endpoint (OPENAI_BASE_URL, e.g. DeepSeek) while
+      // embeddings stay on OpenAI: embeddings would authenticate to
+      // OPENAI_EMBEDDING_BASE_URL with the chat provider's key and 401.
+      // Single-key setups are unaffected — the fallback still finds OPENAI_API_KEY.
+      return withDimensionGuard(new OpenAIEmbeddingProvider());
     case "voyage":
       return withDimensionGuard(new VoyageEmbeddingProvider(getEnvVar("VOYAGE_API_KEY")!));
     case "cohere":
