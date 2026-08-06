@@ -24,7 +24,10 @@ import { StateKV } from "./state/kv.js";
 import { KV } from "./state/schema.js";
 import { VectorIndex } from "./state/vector-index.js";
 import { HybridSearch } from "./state/hybrid-search.js";
-import { IndexPersistence } from "./state/index-persistence.js";
+import {
+  IndexPersistence,
+  resolveIndexOrphanSweepMode,
+} from "./state/index-persistence.js";
 import { registerPrivacyFunction } from "./functions/privacy.js";
 import { registerObserveFunction } from "./functions/observe.js";
 import { registerImageQuotaCleanup } from "./functions/image-quota-cleanup.js";
@@ -100,7 +103,7 @@ import { DedupMap } from "./functions/dedup.js";
 import { registerHealthMonitor } from "./health/monitor.js";
 import { initMetrics, OTEL_CONFIG } from "./telemetry/setup.js";
 import { VERSION } from "./version.js";
-import { bootLog } from "./logger.js";
+import { bootLog, bootWarn } from "./logger.js";
 import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -468,6 +471,32 @@ async function main() {
     }
   }
 
+  // Orphaned shard generations (D-10). A save() killed between publishing
+  // the new manifest and finishing the previous-generation cleanup loop
+  // leaves shards no manifest references; nothing in the runtime ever
+  // reads or removes them, so the store only grows. Sweep here: after the
+  // index is restored (the manifests are the sweep's live picture) and
+  // before rebuildIndex starts writing, so the two never race for KV.
+  // Default mode is "dry" — count and log only; deletion needs an
+  // explicit AGENTMEMORY_INDEX_ORPHAN_SWEEP=on.
+  const orphanSweepMode = resolveIndexOrphanSweepMode(
+    getEnvVar("AGENTMEMORY_INDEX_ORPHAN_SWEEP"),
+  );
+  const orphanSweep = await indexPersistence
+    .sweepOrphanGenerations(orphanSweepMode)
+    .catch((err) => {
+      // Boot must not depend on the sweep (livez included).
+      console.warn(`[agentmemory] Index orphan sweep failed:`, err);
+      return null;
+    });
+  if (orphanSweep && orphanSweep.candidates.length > 0) {
+    bootLog(
+      `Index orphan sweep (${orphanSweep.mode}): ` +
+        `${orphanSweep.candidates.length} orphaned shard scopes, ` +
+        `${orphanSweep.deleted} deleted`,
+    );
+  }
+
   const needsRebuild = bm25Index.size === 0;
 
   if (needsRebuild) {
@@ -557,6 +586,7 @@ async function main() {
 
   const autoForgetIntervalMs = parseInt(process.env.AUTO_FORGET_INTERVAL_MS || "3600000", 10);
   const consolidationIntervalMs = parseInt(process.env.CONSOLIDATION_INTERVAL_MS || "7200000", 10);
+  const evictIntervalMs = parseInt(process.env.EVICT_INTERVAL_MS || "86400000", 10);
 
   if (process.env.AUTO_FORGET_ENABLED !== "false") {
     const autoForgetTimer = setInterval(async () => {
@@ -609,6 +639,31 @@ async function main() {
     }, consolidationIntervalMs);
     consolidationTimer.unref();
     bootLog(`Auto-consolidation: enabled (every ${consolidationIntervalMs / 60000}m)`);
+  }
+
+  // D-3(a): the eviction policy (staleSessionDays, maxObservationsPerProject)
+  // existed from the start but nothing inside the daemon ever applied it.
+  // The catch here deliberately logs, unlike the sweeps above: a sweep that
+  // fails every day would otherwise be indistinguishable from "the store is
+  // just growing".
+  if (process.env.EVICT_ENABLED !== "false") {
+    let evictRunning = false;
+    const evictTimer = setInterval(async () => {
+      if (evictRunning) {
+        bootWarn(`Eviction sweep: previous run still in progress, skipping tick`);
+        return;
+      }
+      evictRunning = true;
+      try {
+        await sdk.trigger({ function_id: "mem::evict", payload: { dryRun: false } });
+      } catch (err) {
+        console.warn(`[agentmemory] Scheduled eviction failed:`, err);
+      } finally {
+        evictRunning = false;
+      }
+    }, evictIntervalMs);
+    evictTimer.unref();
+    bootLog(`Eviction sweep: enabled (every ${evictIntervalMs / 60000}m)`);
   }
 
   const shutdown = async () => {

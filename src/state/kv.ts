@@ -44,4 +44,42 @@ export class StateKV {
       payload: { scope },
     })
   }
+
+  /**
+   * Every scope (group) that currently holds at least one key.
+   *
+   * Contract established against iii-engine 0.11.2 on an isolated Docker
+   * stand (wave 7, phase 5 spike):
+   *   - input is `StateListGroupsInput`; an object is required (`null` and
+   *     a bare string are rejected with "invalid type ... expected struct
+   *     StateListGroupsInput"). Unknown fields are IGNORED: `{}`,
+   *     `{prefix}`, `{scope}`, `{pattern}` all return the identical list,
+   *     so the engine offers NO server-side filtering — callers filter.
+   *   - output is `{ groups: string[] }` — every scope in the store, not
+   *     just index ones. 3008 groups answered in 3-18 ms / 72 KB.
+   *   - a scope stays in the list after its last key is deleted, and
+   *     disappears only after an engine restart.
+   *
+   * Throws when the response has no `groups` array: callers that delete
+   * by this list must fail closed rather than act on a partial picture.
+   */
+  async listGroups(): Promise<string[]> {
+    const response = await this.sdk.trigger<
+      Record<string, never>,
+      { groups?: unknown } | null
+    >({
+      function_id: 'state::list_groups',
+      payload: {},
+    })
+    const groups = response?.groups
+    if (!Array.isArray(groups)) {
+      throw new Error("state::list_groups response: missing 'groups' array")
+    }
+    for (const group of groups) {
+      if (typeof group !== 'string') {
+        throw new Error("state::list_groups response: non-string group entry")
+      }
+    }
+    return groups as string[]
+  }
 }

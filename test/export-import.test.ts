@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -6,7 +6,14 @@ vi.mock("../src/logger.js", () => ({
 
 import { registerExportImportFunction } from "../src/functions/export-import.js";
 import { VERSION } from "../src/version.js";
-import { getSearchIndex } from "../src/functions/search.js";
+import {
+  getSearchIndex,
+  getVectorIndex,
+  setIndexPersistence,
+  setVectorIndex,
+} from "../src/functions/search.js";
+import { VectorIndex } from "../src/state/vector-index.js";
+import { memoryToObservation } from "../src/state/memory-utils.js";
 import type {
   Session,
   CompressedObservation,
@@ -103,9 +110,34 @@ const testSummary: SessionSummary = {
   observationCount: 1,
 };
 
+// Seeds the pre-existing corpus into both indexes, the state a real
+// install is in when mem::import runs: rows in KV *and* in the index.
+function indexExistingCorpus(): void {
+  getSearchIndex().add(testObs);
+  getVectorIndex()!.add(testObs.id, testObs.sessionId, new Float32Array([0.1, 0.2]));
+  const memAsObs = memoryToObservation(testMemory);
+  getSearchIndex().add(memAsObs);
+  getVectorIndex()!.add(
+    memAsObs.id,
+    memAsObs.sessionId,
+    new Float32Array([0.3, 0.4]),
+  );
+}
+
+// VectorIndex exposes no has(); read the serialized ids.
+function vectorHas(id: string): boolean {
+  return (
+    JSON.parse(getVectorIndex()!.serialize()) as Array<[string, unknown]>
+  ).some(([obsId]) => obsId === id);
+}
+
 describe("Export/Import Functions", () => {
   let sdk: ReturnType<typeof mockSdk>;
   let kv: ReturnType<typeof mockKV>;
+  let persistence: {
+    scheduleSave: ReturnType<typeof vi.fn>;
+    save: ReturnType<typeof vi.fn>;
+  };
 
   beforeEach(async () => {
     sdk = mockSdk();
@@ -114,12 +146,21 @@ describe("Export/Import Functions", () => {
     // tests. Clear it so index assertions here don't see rows added by
     // a prior test's import.
     getSearchIndex().clear();
+    setVectorIndex(new VectorIndex());
+    persistence = { scheduleSave: vi.fn(), save: vi.fn(async () => {}) };
+    setIndexPersistence(persistence);
     registerExportImportFunction(sdk as never, kv as never);
 
     await kv.set("mem:sessions", "ses_1", testSession);
     await kv.set("mem:obs:ses_1", "obs_1", testObs);
     await kv.set("mem:memories", "mem_1", testMemory);
     await kv.set("mem:summaries", "ses_1", testSummary);
+  });
+
+  afterEach(() => {
+    getSearchIndex().clear();
+    setVectorIndex(null);
+    setIndexPersistence(null);
   });
 
   it("export produces valid ExportData structure", async () => {
@@ -258,6 +299,149 @@ describe("Export/Import Functions", () => {
 
     const oldSession = await kv.get("mem:sessions", "ses_1");
     expect(oldSession).toBeNull();
+  });
+
+  // Regression (wave 7, Д-3(б)): "replace" wiped observations and memories
+  // from KV but left their rows in BM25 and the vector index, so the index
+  // kept growing with entries whose corpus was gone.
+  describe("replace strategy prunes the search index", () => {
+    const importedObs: CompressedObservation = {
+      id: "obs_replaced",
+      sessionId: "ses_replaced",
+      timestamp: "2026-04-01T10:00:00Z",
+      type: "file_edit",
+      title: "Terraform module split",
+      facts: ["Split the network module"],
+      narrative: "Reworked the terraform module layout",
+      concepts: ["terraform"],
+      files: ["main.tf"],
+      importance: 6,
+    };
+    const importedMem: Memory = {
+      ...testMemory,
+      id: "mem_replaced",
+      title: "Redis eviction policy",
+      content: "Use allkeys-lru for the cache instance",
+    };
+    const replaceData: ExportData = {
+      version: "0.9.28",
+      exportedAt: "2026-04-01T00:00:00Z",
+      sessions: [
+        {
+          ...testSession,
+          id: "ses_replaced",
+          project: "new-project",
+          observationCount: 1,
+        },
+      ],
+      observations: { ses_replaced: [importedObs] },
+      memories: [importedMem],
+      summaries: [],
+    };
+
+    it("removes the old observation and memory from BM25", async () => {
+      indexExistingCorpus();
+      expect(getSearchIndex().has("obs_1")).toBe(true);
+      expect(getSearchIndex().has("mem_1")).toBe(true);
+
+      const result = (await sdk.trigger("mem::import", {
+        exportData: replaceData,
+        strategy: "replace",
+      })) as { success: boolean };
+
+      expect(result.success).toBe(true);
+      expect(getSearchIndex().has("obs_1")).toBe(false);
+      expect(getSearchIndex().has("mem_1")).toBe(false);
+    });
+
+    it("removes the old observation and memory from the vector index", async () => {
+      indexExistingCorpus();
+      expect(getVectorIndex()!.size).toBe(2);
+
+      await sdk.trigger("mem::import", {
+        exportData: replaceData,
+        strategy: "replace",
+      });
+
+      // No embedding provider is wired, so the import adds nothing to the
+      // vector side: both seeded rows gone means size 0.
+      expect(getVectorIndex()!.size).toBe(0);
+      expect(vectorHas("obs_1")).toBe(false);
+      expect(vectorHas("mem_1")).toBe(false);
+    });
+
+    it("keeps the imported records in the index", async () => {
+      indexExistingCorpus();
+
+      await sdk.trigger("mem::import", {
+        exportData: replaceData,
+        strategy: "replace",
+      });
+
+      // Catches "pruned too much" — e.g. a clear() placed after indexRecords.
+      expect(getSearchIndex().has("obs_replaced")).toBe(true);
+      expect(getSearchIndex().has("mem_replaced")).toBe(true);
+    });
+
+    it("flushes persistence exactly once for the whole import", async () => {
+      indexExistingCorpus();
+
+      await sdk.trigger("mem::import", {
+        exportData: replaceData,
+        strategy: "replace",
+      });
+
+      // Two removals plus two additions, one full index save: catches a
+      // flush moved into the replace block or into a loop.
+      expect(persistence.save).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("merge strategy leaves the existing index rows in place", async () => {
+    indexExistingCorpus();
+
+    const result = (await sdk.trigger("mem::import", {
+      exportData: {
+        version: "0.9.28",
+        exportedAt: "2026-04-01T00:00:00Z",
+        sessions: [{ ...testSession, id: "ses_2", observationCount: 0 }],
+        observations: {},
+        memories: [{ ...testMemory, id: "mem_2", title: "New pattern" }],
+        summaries: [],
+      } as ExportData,
+      strategy: "merge",
+    })) as { success: boolean };
+
+    expect(result.success).toBe(true);
+    expect(getSearchIndex().has("obs_1")).toBe(true);
+    expect(getSearchIndex().has("mem_1")).toBe(true);
+    expect(vectorHas("obs_1")).toBe(true);
+    expect(vectorHas("mem_1")).toBe(true);
+    // One import indexed one memory, so exactly one flush — not zero.
+    expect(persistence.save).toHaveBeenCalledTimes(1);
+  });
+
+  it("skip strategy leaves the index and persistence untouched", async () => {
+    indexExistingCorpus();
+
+    const result = (await sdk.trigger("mem::import", {
+      exportData: {
+        version: "0.9.28",
+        exportedAt: "2026-04-01T00:00:00Z",
+        sessions: [testSession],
+        observations: { ses_1: [testObs] },
+        memories: [testMemory],
+        summaries: [testSummary],
+      } as ExportData,
+      strategy: "skip",
+    })) as { success: boolean; skipped: number };
+
+    expect(result.success).toBe(true);
+    expect(result.skipped).toBeGreaterThan(0);
+    expect(getSearchIndex().has("obs_1")).toBe(true);
+    expect(getSearchIndex().has("mem_1")).toBe(true);
+    // Nothing written, nothing indexed → no ~297 MB save.
+    expect(persistence.save).not.toHaveBeenCalled();
   });
 
   it("export then import round-trip preserves data", async () => {

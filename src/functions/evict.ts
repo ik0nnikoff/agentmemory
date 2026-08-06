@@ -5,12 +5,14 @@ import type {
   RawObservation,
   SessionSummary,
   Memory,
+  Facet,
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { isConsolidationEnabled } from "../config.js";
 import { recordAudit } from "./audit.js";
 import { deleteAccessLog } from "./access-tracker.js";
+import { getSearchIndex, vectorIndexRemove, flushIndexSave } from "./search.js";
 import { logger } from "../logger.js";
 
 interface EvictionConfig {
@@ -35,6 +37,7 @@ interface EvictionStats {
   capEvictions: number;
   expiredMemories: number;
   nonLatestMemories: number;
+  facetsRemoved: number;
   dryRun: boolean;
 }
 
@@ -123,6 +126,7 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
         capEvictions: 0,
         expiredMemories: 0,
         nonLatestMemories: 0,
+        facetsRemoved: 0,
         dryRun,
       };
 
@@ -132,6 +136,23 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
         .list<SessionSummary>(KV.summaries)
         .catch(() => []);
       const summaryIds = new Set(summaries.map((s) => s.sessionId));
+
+      // Facet cascade (issue Д-20): the facet namespace is flat and has no
+      // index by targetId (schema.ts:57), so every lookup by target is a full
+      // scan. One scan per run, folded into a map, keeps the cascade linear
+      // instead of N x full-scan. Deliberately unfiltered by targetType:
+      // action, memory and observation are all valid facet targets
+      // (types.ts:770), and the cascade must not depend on which of them carry facets
+      // today. Sessions are not a valid target type, so the stale-session
+      // branch below never cascades.
+      const facets = await kv.list<Facet>(KV.facets).catch(() => []);
+      const facetsByTarget = new Map<string, string[]>();
+      for (const f of facets) {
+        const list = facetsByTarget.get(f.targetId);
+        if (list) list.push(f.id);
+        else facetsByTarget.set(f.targetId, [f.id]);
+      }
+      const removedFacetIds: string[] = [];
 
       for (const session of sessions) {
         if (!session.startedAt) continue;
@@ -212,6 +233,7 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
           ) {
             if (dryRun) {
               stats.lowImportanceObs++;
+              stats.facetsRemoved += (facetsByTarget.get(o.id) ?? []).length;
             } else {
               try {
                 await kv.delete(KV.observations(session.id), o.id);
@@ -233,6 +255,21 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
                 sessionId: session.id,
                 dryRun,
               });
+              getSearchIndex().remove(o.id);
+              vectorIndexRemove(o.id);
+              for (const fid of facetsByTarget.get(o.id) ?? []) {
+                try {
+                  await kv.delete(KV.facets, fid);
+                  removedFacetIds.push(fid);
+                  stats.facetsRemoved++;
+                } catch (err) {
+                  logger.warn("Facet cascade delete failed", {
+                    facetId: fid,
+                    targetId: o.id,
+                    error: err instanceof Error ? err.message : String(err),
+                  });
+                }
+              }
             }
           }
         }
@@ -254,6 +291,9 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
           );
           if (dryRun) {
             stats.capEvictions += toEvict.length;
+            for (const o of toEvict) {
+              stats.facetsRemoved += (facetsByTarget.get(o.id) ?? []).length;
+            }
           } else {
             for (const o of toEvict) {
               try {
@@ -276,6 +316,21 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
                 sessionId: o.sessionId,
                 dryRun,
               });
+              getSearchIndex().remove(o.id);
+              vectorIndexRemove(o.id);
+              for (const fid of facetsByTarget.get(o.id) ?? []) {
+                try {
+                  await kv.delete(KV.facets, fid);
+                  removedFacetIds.push(fid);
+                  stats.facetsRemoved++;
+                } catch (err) {
+                  logger.warn("Facet cascade delete failed", {
+                    facetId: fid,
+                    targetId: o.id,
+                    error: err instanceof Error ? err.message : String(err),
+                  });
+                }
+              }
             }
           }
         }
@@ -290,6 +345,7 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
             if (dryRun) {
               stats.expiredMemories++;
               evictedMemIds.add(mem.id);
+              stats.facetsRemoved += (facetsByTarget.get(mem.id) ?? []).length;
             } else {
               try {
                 await kv.delete(KV.memories, mem.id);
@@ -313,6 +369,21 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
                 dryRun,
               });
               await deleteAccessLog(kv, mem.id);
+              getSearchIndex().remove(mem.id);
+              vectorIndexRemove(mem.id);
+              for (const fid of facetsByTarget.get(mem.id) ?? []) {
+                try {
+                  await kv.delete(KV.facets, fid);
+                  removedFacetIds.push(fid);
+                  stats.facetsRemoved++;
+                } catch (err) {
+                  logger.warn("Facet cascade delete failed", {
+                    facetId: fid,
+                    targetId: mem.id,
+                    error: err instanceof Error ? err.message : String(err),
+                  });
+                }
+              }
             }
           }
         }
@@ -326,6 +397,7 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
           if (age > cfg.lowImportanceMaxDays * MS_PER_DAY) {
             if (dryRun) {
               stats.nonLatestMemories++;
+              stats.facetsRemoved += (facetsByTarget.get(mem.id) ?? []).length;
             } else {
               try {
                 await kv.delete(KV.memories, mem.id);
@@ -348,9 +420,43 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
                 dryRun,
               });
               await deleteAccessLog(kv, mem.id);
+              getSearchIndex().remove(mem.id);
+              vectorIndexRemove(mem.id);
+              for (const fid of facetsByTarget.get(mem.id) ?? []) {
+                try {
+                  await kv.delete(KV.facets, fid);
+                  removedFacetIds.push(fid);
+                  stats.facetsRemoved++;
+                } catch (err) {
+                  logger.warn("Facet cascade delete failed", {
+                    facetId: fid,
+                    targetId: mem.id,
+                    error: err instanceof Error ? err.message : String(err),
+                  });
+                }
+              }
             }
           }
         }
+      }
+
+      // One flush per run, never per deletion: a full index save is ~297 MB
+      // of writes. staleSessions is excluded on purpose — sessions are not
+      // indexed, so evicting one leaves the index unchanged.
+      if (!dryRun && (stats.lowImportanceObs + stats.capEvictions
+          + stats.expiredMemories + stats.nonLatestMemories) > 0) {
+        await flushIndexSave();
+      }
+
+      // One batched audit row per run for the facet cascade, per the policy in
+      // audit.ts:16-20. The per-object rows above stay as they are (a wave-2
+      // decision); the cascade is new, so it follows the policy from the start.
+      if (!dryRun && removedFacetIds.length > 0) {
+        await recordAudit(kv, "delete", "mem::evict", removedFacetIds, {
+          resource: "facet",
+          reason: "cascade_target_evicted",
+          dryRun,
+        });
       }
 
       logger.info("Eviction complete", { stats });

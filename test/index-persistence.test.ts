@@ -5,6 +5,7 @@ import { VectorIndex } from "../src/state/vector-index.js";
 import type { CompressedObservation } from "../src/types.js";
 
 const BM25_SCOPE = "mem:index:bm25";
+const BM25_SHARD_SCOPE = "mem:index:bm25:bm25:";
 const BM25_LEGACY_KEY = "data";
 const BM25_MANIFEST_KEY = "data:manifest";
 const VECTOR_LEGACY_KEY = "vectors";
@@ -69,6 +70,11 @@ function makeVector(id = "obs_1"): VectorIndex {
   const vector = new VectorIndex();
   vector.add(id, "ses_1", new Float32Array([0.1, 0.2, 0.3]));
   return vector;
+}
+
+// Fake timers are on, so concurrency is driven by microtasks only.
+async function flushMicrotasks(ticks = 50): Promise<void> {
+  for (let i = 0; i < ticks; i++) await Promise.resolve();
 }
 
 async function getBm25Manifest(kv: MockKV): Promise<TestIndexShardManifest> {
@@ -775,6 +781,142 @@ describe("IndexPersistence", () => {
     const loaded = await persistence.load();
     expect(loaded.bm25).toBeNull();
     expect(loaded.vector).toBeNull();
+  });
+
+  // D-26: save() had no mutex. saveShardedIndex() reads the previous
+  // manifest at the start and deletes its shards at the end, so two
+  // overlapping saves published two generations and both deleted the same
+  // previous one - one new generation stayed on disk with nothing pointing
+  // at it (53 MB precedent, idx_msc9tku7).
+  it("serializes concurrent save() calls so no generation is orphaned", async () => {
+    const bm25 = makeBm25("obs_1", "concurrent snapshot ".repeat(20));
+    let generation = 0;
+    const liveShards = new Set<string>();
+    let releaseFirstShardWrite = (): void => {};
+    const firstShardWriteGate = new Promise<void>((resolve) => {
+      releaseFirstShardWrite = resolve;
+    });
+    let gateArmed = true;
+    const gatedKv = {
+      ...kv,
+      set: async <T>(scope: string, key: string, data: T): Promise<T> => {
+        // Hold the first generation mid-write so the second save() would
+        // overlap it if nothing serialized them.
+        if (gateArmed && scope.startsWith(`${BM25_SHARD_SCOPE}gen_1:`)) {
+          gateArmed = false;
+          await firstShardWriteGate;
+        }
+        if (scope.startsWith(BM25_SHARD_SCOPE)) {
+          liveShards.add(`${scope}/${key}`);
+        }
+        return kv.set(scope, key, data);
+      },
+      delete: async (scope: string, key: string): Promise<void> => {
+        liveShards.delete(`${scope}/${key}`);
+        return kv.delete(scope, key);
+      },
+    };
+
+    const persistence = new IndexPersistence(gatedKv as never, bm25, null, {
+      shardChars: 80,
+      createGeneration: () => `gen_${++generation}`,
+    });
+
+    const first = persistence.save();
+    const second = persistence.save();
+    await flushMicrotasks();
+    releaseFirstShardWrite();
+    await Promise.all([first, second]);
+
+    const manifest = await getBm25Manifest(kv);
+    const manifestShards = manifest.shards
+      .map((shard) => `${shard.scope}/${shard.key}`)
+      .sort();
+    // The published manifest must be the one written last, and every shard
+    // left in the store must belong to it.
+    expect(manifest.generation).toBe("gen_2");
+    expect(manifest.shards.length).toBeGreaterThan(1);
+    expect([...liveShards].sort()).toEqual(manifestShards);
+    expect(liveShards.size).toBe(manifest.shards.length);
+    const loaded = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+    expect(loaded.bm25!.search("concurrent").length).toBe(1);
+  });
+
+  // The lock queues saves, it does not coalesce them: two save() calls owe
+  // two manifest publications. If coalescing is ever added it must be a
+  // deliberate change, not a side effect (README residual risk 7).
+  it("queues concurrent save() calls instead of dropping one", async () => {
+    const bm25 = makeBm25("obs_1", "queued snapshot");
+    let generation = 0;
+    const manifestGenerations: Array<string | undefined> = [];
+    const trackingKv = {
+      ...kv,
+      set: async <T>(scope: string, key: string, data: T): Promise<T> => {
+        if (scope === BM25_SCOPE && key === BM25_MANIFEST_KEY) {
+          manifestGenerations.push(
+            (data as TestIndexShardManifest).generation,
+          );
+        }
+        return kv.set(scope, key, data);
+      },
+    };
+
+    const persistence = new IndexPersistence(trackingKv as never, bm25, null, {
+      shardChars: 80,
+      createGeneration: () => `gen_${++generation}`,
+    });
+
+    await Promise.all([persistence.save(), persistence.save()]);
+
+    expect(manifestGenerations).toEqual(["gen_1", "gen_2"]);
+  });
+
+  // Debounce cancellation must stay outside the lock: a timer armed while
+  // the lock is held would fire during the wait and queue a third full save.
+  it("save() cancels a pending scheduled save while the lock is held", async () => {
+    const bm25 = makeBm25("obs_1", "debounce cancel snapshot");
+    let generation = 0;
+    const manifestGenerations: Array<string | undefined> = [];
+    let releaseFirstShardWrite = (): void => {};
+    const firstShardWriteGate = new Promise<void>((resolve) => {
+      releaseFirstShardWrite = resolve;
+    });
+    let gateArmed = true;
+    const gatedKv = {
+      ...kv,
+      set: async <T>(scope: string, key: string, data: T): Promise<T> => {
+        if (gateArmed && scope.startsWith(`${BM25_SHARD_SCOPE}gen_1:`)) {
+          gateArmed = false;
+          await firstShardWriteGate;
+        }
+        if (scope === BM25_SCOPE && key === BM25_MANIFEST_KEY) {
+          manifestGenerations.push(
+            (data as TestIndexShardManifest).generation,
+          );
+        }
+        return kv.set(scope, key, data);
+      },
+    };
+
+    const persistence = new IndexPersistence(gatedKv as never, bm25, null, {
+      shardChars: 80,
+      createGeneration: () => `gen_${++generation}`,
+    });
+
+    const first = persistence.save();
+    persistence.scheduleSave();
+    const second = persistence.save();
+    // Debounce would fire here if save() cleared the timer inside the lock.
+    vi.advanceTimersByTime(10_000);
+    releaseFirstShardWrite();
+    await Promise.all([first, second]);
+    await flushMicrotasks();
+
+    expect(manifestGenerations).toEqual(["gen_1", "gen_2"]);
   });
 
   it("load() does not crash when a manifest row value is the wrong shape (#797)", async () => {

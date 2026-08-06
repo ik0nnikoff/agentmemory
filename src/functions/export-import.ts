@@ -30,7 +30,12 @@ import { checkPayloadFrameSize } from "../state/frame-guard.js";
 import { StateKV } from "../state/kv.js";
 import { VERSION } from "../version.js";
 import { recordAudit } from "./audit.js";
-import { indexRecords } from "./search.js";
+import {
+  indexRecords,
+  getSearchIndex,
+  vectorIndexRemove,
+  flushIndexSave,
+} from "./search.js";
 import { logger } from "../logger.js";
 
 // Bounded-concurrency chunk size for the import delete/write loops. A
@@ -303,6 +308,11 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         skipped: 0,
       };
 
+      // Search-index rows dropped by the "replace" wipe below. Only used
+      // to decide whether the single flush at the end of this handler is
+      // needed; not reported in stats (the response shape is a contract).
+      let removedFromIndex = 0;
+
       if (strategy === "replace") {
         const existing = await kv.list<Session>(KV.sessions);
         // Collect observation deletes across all sessions, then run them in
@@ -321,9 +331,23 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         await runChunked(obsDeletes, (d) =>
           kv.delete(KV.observations(d.sessionId), d.obsId),
         );
-        await runChunked(await kv.list<Memory>(KV.memories), (m) =>
-          kv.delete(KV.memories, m.id),
-        );
+        // Observations and memories are the only two of the 21 wiped
+        // namespaces that reach the search index, so these are the only
+        // two prune points. Prune by id rather than clear(): a blanket
+        // clear would also drop rows a concurrent session added between
+        // the kv.list above and here, i.e. more than was deleted.
+        for (const d of obsDeletes) {
+          getSearchIndex().remove(d.obsId);
+          vectorIndexRemove(d.obsId);
+          removedFromIndex++;
+        }
+        const memsToDelete = await kv.list<Memory>(KV.memories);
+        await runChunked(memsToDelete, (m) => kv.delete(KV.memories, m.id));
+        for (const m of memsToDelete) {
+          getSearchIndex().remove(m.id);
+          vectorIndexRemove(m.id);
+          removedFromIndex++;
+        }
         await runChunked(
           await kv.list<SessionSummary>(KV.summaries),
           (s) => kv.delete(KV.summaries, s.sessionId),
@@ -657,12 +681,22 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
       // rather than one giant Promise.all over 500k docs. Indexing
       // failures are logged, not fatal — the KV writes already committed
       // and the restart rebuild is the backstop.
+      let indexedCount = 0;
       try {
-        await indexRecords(indexObs, indexMems);
+        indexedCount = await indexRecords(indexObs, indexMems);
       } catch (err) {
         logger.warn("Import indexing failed; restart rebuild will recover", {
           error: err instanceof Error ? err.message : String(err),
         });
+      }
+
+      // One flush per import, never per namespace: save() serializes the
+      // whole index (~297 MB of writes), so a flush inside the "replace"
+      // block plus one here would double the cost for no gain. This single
+      // call persists both the replace-time removals and the additions
+      // above — indexRecords itself asks for no save.
+      if (removedFromIndex > 0 || indexedCount > 0) {
+        await flushIndexSave();
       }
 
       logger.info("Import complete", { strategy, ...stats });

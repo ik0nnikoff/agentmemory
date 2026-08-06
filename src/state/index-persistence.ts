@@ -4,10 +4,12 @@ import type { StateKV } from "./kv.js";
 import { KV, generateId } from "./schema.js";
 import { logger } from "../logger.js";
 import { safeAudit } from "../functions/audit.js";
+import { withKeyedLock } from "./keyed-mutex.js";
 
 const DEBOUNCE_MS = 5000;
 const FAILURE_LOG_THROTTLE_MS = 60_000;
 const INDEX_PERSISTENCE_FUNCTION_ID = "mem::index-persistence";
+const SAVE_LOCK_KEY = "mem::index-persistence:save";
 const BM25_KEY = "data";
 const BM25_MANIFEST_KEY = "data:manifest";
 const BM25_SHARD_SCOPE_PREFIX = `${KV.bm25Index}:bm25:`;
@@ -28,6 +30,43 @@ type IndexPersistenceOptions = {
   shardChars?: number;
   createGeneration?: () => string;
 };
+
+/**
+ * Boot-time sweep of shard generations no manifest references (D-10).
+ * "dry" only counts and logs; "on" deletes; "off" does nothing.
+ */
+export type IndexOrphanSweepMode = "off" | "dry" | "on";
+
+export type IndexOrphanSweepResult = {
+  mode: IndexOrphanSweepMode;
+  /** false when a fail-closed gate stopped the sweep before any delete */
+  swept: boolean;
+  skippedReason?: string;
+  /** orphan shard scopes that still hold data */
+  candidates: string[];
+  deleted: number;
+};
+
+/** Live picture assembled from BOTH manifests; deletion needs all of it. */
+type LiveShardPicture = {
+  scopes: Set<string>;
+  generations: Set<string>;
+};
+
+const ORPHAN_SWEEP_REASON = "orphan_generation_sweep";
+
+/**
+ * Anything but the three known words — including an unset variable — is
+ * "dry". The boot path must never fall into deleting because a typo in
+ * the env looked like a mode (invariant: production mode is explicit).
+ */
+export function resolveIndexOrphanSweepMode(
+  raw: string | undefined,
+): IndexOrphanSweepMode {
+  const value = (raw ?? "").trim().toLowerCase();
+  if (value === "off" || value === "dry" || value === "on") return value;
+  return "dry";
+}
 
 function shardChars(options: IndexPersistenceOptions): number {
   const configured = options.shardChars;
@@ -65,6 +104,28 @@ function isValidShardDescriptor(
   );
 }
 
+/**
+ * `mem:index:bm25:bm25:<generation>:00007` -> generation `<generation>`.
+ * Returns null for anything that is not exactly a shard scope of one of
+ * the two known prefixes: the sweep must never widen past them.
+ */
+function parseShardScope(
+  scope: string,
+): { prefix: string; generation: string } | null {
+  for (const prefix of [BM25_SHARD_SCOPE_PREFIX, VECTOR_SHARD_SCOPE_PREFIX]) {
+    if (!scope.startsWith(prefix)) continue;
+    const rest = scope.slice(prefix.length);
+    const separator = rest.indexOf(":");
+    if (separator <= 0) return null;
+    const generation = rest.slice(0, separator);
+    const shardIndex = rest.slice(separator + 1);
+    // saveShardedIndex pads the shard index to five digits (:196-199).
+    if (!/^[0-9]{5}$/.test(shardIndex)) return null;
+    return { prefix, generation };
+  }
+  return null;
+}
+
 export class IndexPersistence {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private lastFailureLogAt = 0;
@@ -88,18 +149,26 @@ export class IndexPersistence {
   }
 
   async save(): Promise<void> {
+    // Debounce cancellation stays OUTSIDE the lock: a timer armed while the
+    // lock is held would fire during the wait and queue a redundant save.
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
-    try {
-      await this.saveBm25Index(this.bm25.serialize());
-      if (this.vector) {
-        await this.saveVectorIndex(this.vector.serialize());
+    // Both halves under ONE key: saveShardedIndex() reads the previous
+    // manifest first and deletes its shards last, so two overlapping saves
+    // publish two generations and both delete the old one, orphaning one of
+    // the new ones forever (D-26).
+    return withKeyedLock(SAVE_LOCK_KEY, async () => {
+      try {
+        await this.saveBm25Index(this.bm25.serialize());
+        if (this.vector) {
+          await this.saveVectorIndex(this.vector.serialize());
+        }
+      } catch (err) {
+        this.logFailure(err);
       }
-    } catch (err) {
-      this.logFailure(err);
-    }
+    });
   }
 
   async load(): Promise<{
@@ -120,6 +189,210 @@ export class IndexPersistence {
     }
 
     return { bm25, vector };
+  }
+
+  /**
+   * Delete shard generations that no manifest points at any more (D-10).
+   *
+   * saveShardedIndex() publishes the new manifest (:225) and only then
+   * walks the previous generation shard by shard (:268-276). A process
+   * death inside that loop leaves shards nothing references: the manifest
+   * link is already gone, load() never reads them, and no runtime path
+   * enumerates the namespace. They only grow the store — 55 MB in the
+   * observed case. This sweep is the one path that can remove them.
+   *
+   * Safety, in order of importance:
+   *   - fail-closed: an unreadable or malformed manifest (either of the
+   *     two) aborts the whole sweep — deleting on a partial picture is
+   *     how you delete the live index;
+   *   - only the two shard prefixes are ever considered, and only scopes
+   *     that parse as `<prefix><generation>:<5 digits>`;
+   *   - a scope is deleted only when it is BOTH absent from the live
+   *     scope set AND carries a generation no manifest mentions;
+   *   - it runs under save()'s lock key, so no save can publish a new
+   *     generation between "read the manifests" and "list the scopes";
+   *   - every delete writes an audit row, plus one summary row.
+   *
+   * Non-fatal by construction: any failure returns a skipped result, boot
+   * continues.
+   */
+  async sweepOrphanGenerations(
+    mode: IndexOrphanSweepMode = "dry",
+  ): Promise<IndexOrphanSweepResult> {
+    const skipped = (reason: string): IndexOrphanSweepResult => ({
+      mode,
+      swept: false,
+      skippedReason: reason,
+      candidates: [],
+      deleted: 0,
+    });
+    if (mode === "off") return skipped("disabled");
+
+    return withKeyedLock(SAVE_LOCK_KEY, async () => {
+      try {
+        const live = await this.readLiveShardPicture();
+        if (!live) return skipped("manifest_unusable");
+
+        let groups: string[];
+        try {
+          groups = await this.kv.listGroups();
+        } catch (err) {
+          logger.warn(
+            "index persistence: orphan sweep skipped, scope listing failed",
+            { message: errorMessage(err) },
+          );
+          return skipped("list_groups_failed");
+        }
+
+        // Cheap filter first (string work), then one read per surviving
+        // candidate: iii-engine keeps an emptied scope in list_groups
+        // until the next engine restart, so without the emptiness check a
+        // second boot would re-delete and re-audit the same dead scopes.
+        const orphanScopes = groups
+          .filter((scope) => this.isOrphanShardScope(scope, live))
+          .sort();
+        const candidates: string[] = [];
+        for (const scope of orphanScopes) {
+          if (await this.shardScopeHasData(scope)) candidates.push(scope);
+        }
+        if (candidates.length === 0) {
+          return { mode, swept: true, candidates: [], deleted: 0 };
+        }
+
+        const generations = Array.from(
+          new Set(
+            candidates
+              .map((scope) => parseShardScope(scope)?.generation)
+              .filter((generation): generation is string => !!generation),
+          ),
+        ).sort();
+        // Intent is recorded BEFORE the first delete (audit.ts:16-31), so
+        // a sweep that dies halfway still leaves the candidate list.
+        await this.auditIndexPersistence(
+          "orphan_sweep",
+          candidates.map((scope) => statePath(scope, INDEX_SHARD_KEY)),
+          {
+            reason: ORPHAN_SWEEP_REASON,
+            mode,
+            candidates: candidates.length,
+            generations,
+            result: mode === "dry" ? "dry_run" : "sweeping",
+          },
+        );
+        logger.info("index persistence: orphan shard generations found", {
+          mode,
+          candidates: candidates.length,
+          generations,
+          scopes: candidates.slice(0, 10),
+        });
+        if (mode === "dry") {
+          return { mode, swept: true, candidates, deleted: 0 };
+        }
+
+        let deleted = 0;
+        for (const scope of candidates) {
+          const removed = await this.deleteKey(
+            scope,
+            INDEX_SHARD_KEY,
+            ORPHAN_SWEEP_REASON,
+          );
+          if (removed) deleted += 1;
+        }
+        return { mode, swept: true, candidates, deleted };
+      } catch (err) {
+        logger.warn("index persistence: orphan sweep failed", {
+          message: errorMessage(err),
+        });
+        return skipped("error");
+      }
+    });
+  }
+
+  /**
+   * Live scopes and generations from BOTH manifests. Returns null — and
+   * the caller deletes nothing — as soon as anything is off: unreadable
+   * manifest, wrong shape, or a shard scope this code cannot recognise.
+   */
+  private async readLiveShardPicture(): Promise<LiveShardPicture | null> {
+    const picture: LiveShardPicture = {
+      scopes: new Set<string>(),
+      generations: new Set<string>(),
+    };
+    for (const manifestKey of [BM25_MANIFEST_KEY, VECTOR_MANIFEST_KEY]) {
+      let manifest: IndexShardManifest | null;
+      try {
+        manifest = await this.kv.get<IndexShardManifest>(
+          KV.bm25Index,
+          manifestKey,
+        );
+      } catch (err) {
+        logger.warn(
+          "index persistence: orphan sweep skipped, manifest read failed",
+          { manifestKey, message: errorMessage(err) },
+        );
+        return null;
+      }
+      // Same shape check as loadManifestData (:407-422). "Absent" counts
+      // as unusable on purpose: with no manifest every shard scope in the
+      // store would look orphaned.
+      if (
+        manifest == null ||
+        typeof manifest !== "object" ||
+        manifest.v !== 1 ||
+        !Array.isArray(manifest.shards) ||
+        manifest.shards.length === 0 ||
+        !Number.isInteger(manifest.chars) ||
+        manifest.chars < 0
+      ) {
+        logger.warn(
+          "index persistence: orphan sweep skipped, manifest absent or invalid",
+          { manifestKey },
+        );
+        return null;
+      }
+      for (const shard of manifest.shards) {
+        const parsed = isValidShardDescriptor(shard)
+          ? parseShardScope(shard.scope)
+          : null;
+        if (!parsed) {
+          logger.warn(
+            "index persistence: orphan sweep skipped, manifest shard unrecognised",
+            { manifestKey },
+          );
+          return null;
+        }
+        picture.scopes.add(shard.scope);
+        picture.generations.add(parsed.generation);
+      }
+      if (
+        typeof manifest.generation === "string" &&
+        manifest.generation.length > 0
+      ) {
+        picture.generations.add(manifest.generation);
+      }
+    }
+    return picture;
+  }
+
+  private isOrphanShardScope(scope: string, live: LiveShardPicture): boolean {
+    const parsed = parseShardScope(scope);
+    // Not a shard scope of the two known prefixes -> not ours, ever.
+    if (!parsed) return false;
+    if (live.scopes.has(scope)) return false;
+    return !live.generations.has(parsed.generation);
+  }
+
+  private async shardScopeHasData(scope: string): Promise<boolean> {
+    try {
+      const values = await this.kv.list<unknown>(scope);
+      return Array.isArray(values) && values.length > 0;
+    } catch (err) {
+      logger.warn(
+        "index persistence: orphan sweep skipped a scope, listing failed",
+        { scope, message: errorMessage(err) },
+      );
+      return false;
+    }
   }
 
   stop(): void {
@@ -280,11 +553,12 @@ export class IndexPersistence {
     );
   }
 
+  /** @returns true when kv.delete accepted the key; never throws. */
   private async deleteKey(
     scope: string,
     key: string,
     reason: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     let result = "deleted";
     let error: string | undefined;
     try {
@@ -300,6 +574,7 @@ export class IndexPersistence {
       result,
       error,
     });
+    return result === "deleted";
   }
 
   private async deleteShards(
