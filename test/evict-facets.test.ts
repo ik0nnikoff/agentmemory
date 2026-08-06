@@ -342,6 +342,43 @@ describe("mem::evict facet cascade", () => {
     expect(facetIds(store)).toEqual(["fct_obs_high_service"]);
   });
 
+  // Keyless installs compress without an LLM (compress-synthetic.ts:88-101):
+  // empty facts/concepts, fixed importance 5, title = tool name. Every other
+  // fixture here is LLM-shaped, so this pins the cap branch for the shape the
+  // production daemon actually stores.
+  it("removes the facets of a cap-evicted synthetic-form observation", async () => {
+    const synthetic: CompressedObservation = {
+      id: "obs_synth",
+      sessionId: SESSION_ID,
+      timestamp: daysAgo(1),
+      type: "file_read",
+      title: "Read",
+      subtitle: '{"file_path":"src/state/kv.ts"}',
+      facts: [],
+      narrative: '{"file_path":"src/state/kv.ts"} | file contents',
+      concepts: [],
+      files: ["src/state/kv.ts"],
+      importance: 5,
+      confidence: 0.3,
+    };
+    const high = makeObservation("obs_high", { importance: 9 });
+    const { run, store } = runEvict({
+      observations: [synthetic, high],
+      maxObservationsPerProject: 1,
+      facets: [
+        ...facetsFor("obs_synth", "observation", ["service", "stage"]),
+        ...facetsFor("obs_high", "observation", ["service"]),
+      ],
+    });
+
+    const stats = await run();
+
+    expect(stats.capEvictions).toBe(1);
+    expect(stats.lowImportanceObs).toBe(0);
+    expect(stats.facetsRemoved).toBe(2);
+    expect(facetIds(store)).toEqual(["fct_obs_high_service"]);
+  });
+
   it("removes the facets of a low-importance evicted observation", async () => {
     const low = makeObservation("obs_low", {
       importance: 1,
