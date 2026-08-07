@@ -1217,7 +1217,7 @@ Full registry: [workers.iii.dev](https://workers.iii.dev). Every worker there co
 
 ### LLM Providers
 
-agentmemory auto-detects from your environment. By default, no LLM calls are made unless you configure a provider or explicitly opt in to the Claude subscription fallback.
+agentmemory auto-detects from your environment. By default, no LLM calls are made unless you configure a provider or explicitly opt in to one of the two key-less paths — the Codex subscription provider (`AGENTMEMORY_CODEX`) or the Claude subscription fallback (`AGENTMEMORY_ALLOW_AGENT_SDK`). Detection order: `OPENAI_API_KEY` → `MINIMAX_API_KEY` → `ANTHROPIC_API_KEY` → `GEMINI_API_KEY` → `OPENROUTER_API_KEY` → `AGENTMEMORY_CODEX` → `AGENTMEMORY_ALLOW_AGENT_SDK` → no-op.
 
 | Provider | Config | Notes |
 |----------|--------|-------|
@@ -1228,7 +1228,41 @@ agentmemory auto-detects from your environment. By default, no LLM calls are mad
 | OpenRouter | `OPENROUTER_API_KEY` | Any model |
 | OpenAI API | `OPENAI_API_KEY` | Default `gpt-4o-mini`, override with `OPENAI_MODEL` |
 | **Local (Ollama / LM Studio / vLLM / llama.cpp)** | `OPENAI_API_KEY=local` + `OPENAI_BASE_URL=http://localhost:11434/v1` (Ollama) or `http://localhost:1234/v1` (LM Studio) + `OPENAI_MODEL=<your model>` | Anything OpenAI-API-compatible. Zero cost, runs on your hardware. See [Local models](#local-models-ollama--lm-studio--vllm) below. |
+| Codex subscription (ChatGPT) | `AGENTMEMORY_CODEX=true` | Opt-in only. Runs on your ChatGPT/Codex subscription through the Codex CLI — no API key, no per-token billing. Never overrides a configured API key. Spawns `codex exec` child processes; read [Codex subscription provider](#codex-subscription-provider-agentmemory_codex) before enabling. |
 | Claude subscription fallback | `AGENTMEMORY_ALLOW_AGENT_SDK=true` | Opt-in only. Spawns `@anthropic-ai/claude-agent-sdk` sessions — used to cause unbounded Stop-hook recursion so it is no longer the default. |
+
+### Codex subscription provider (`AGENTMEMORY_CODEX`)
+
+Compression and summarization run on your ChatGPT/Codex subscription instead of an API key: the provider spawns `codex exec` child processes through `@openai/codex-sdk`. It is opt-in — nothing changes until you set `AGENTMEMORY_CODEX=true`.
+
+| Variable | Default | What it does |
+|----------|---------|--------------|
+| `AGENTMEMORY_CODEX` | unset | `true` selects the provider |
+| `AGENTMEMORY_CODEX_MODEL` | unset | Unset → Codex picks the model from your own `~/.codex/config.toml`. Any value set here is passed to Codex as-is. |
+| `AGENTMEMORY_CODEX_TIMEOUT_MS` | `90000` | Per-call timeout |
+| `AGENTMEMORY_CODEX_MAX_CONCURRENCY` | `1` | Cap on simultaneous `codex exec` children |
+
+**It never overrides a configured API key.** The branch sits below every keyed provider and above `AGENTMEMORY_ALLOW_AGENT_SDK`, so an installation that already has a key keeps the provider it had. When both key-less flags are set (`AGENTMEMORY_CODEX=true` and `AGENTMEMORY_ALLOW_AGENT_SDK=true`), `codex` wins.
+
+**It requires an active Codex session.** There is no local "am I logged in?" check: the CLI finds out over the network. A missing session therefore surfaces as HTTP 401 from `api.openai.com` after roughly 28 seconds, not as an immediate startup error.
+
+**Latency is higher than the API providers, and that is expected.** Measured on real prompts: a compress-shaped prompt took **27 372 ms**, a summarize-shaped one **21 757 ms**. DeepSeek on the same compress shape took **12 902 ms**. So `compress` runs about twice as slow — that is the normal operating point of this provider, not a failure signal.
+
+**Read this before enabling — what the child process can do.** The SDK spawns `codex exec`, and that process:
+
+- runs shell commands as the daemon's uid;
+- under `sandboxMode: "read-only"` can **read any file** that uid can read — `read-only` restricts writes, not reads, by design (the SDK documents it as "Read files without allowing writes");
+- sees the MCP servers registered in your own `~/.codex/config.toml` (agentmemory's own server is disabled for the duration of each call; the others are not).
+
+The observation text that goes into the compression prompt is **untrusted** — it is tool output, file contents and fetched web pages. Whatever the child reads comes back as a "compressed observation" and is **stored in memory**. No other agentmemory provider has this capability. Enable it as a deliberate choice.
+
+**Authorization is delegated to Codex entirely.** agentmemory does not ask for, store or log credentials, and does not read `~/.codex/auth.json`.
+
+**Weight.** `@openai/codex-sdk` is a hard dependency and pulls a platform binary: **+324 490 419 B** on `darwin-arm64`.
+
+**Do not put `codex` first in `FALLBACK_PROVIDERS`** behind a fast primary provider: a successful call costs ~27 s and a failed one ~28 s, so a chain that reaches it early pays that on every miss.
+
+**Name collision.** `codex` is also the name of a ConnectAdapter (`src/cli/connect/codex.ts`) — that is Codex as a *host agent writing into agentmemory*, the opposite direction, and it has nothing to do with the LLM provider type. Two unrelated namespaces share the string, so grepping for `"codex"` returns both.
 
 ### Local models (Ollama / LM Studio / vLLM)
 
@@ -1288,6 +1322,8 @@ Background compression runs on every observation, so model choice meaningfully c
 | Avoid | `anthropic/claude-opus-4.6` | $15.00 | $75.00 | ~$25+ | Reasoning-class model; massive overspend for compression. |
 
 agentmemory prints a runtime warning when `OPENROUTER_MODEL` matches a premium-tier pattern. Set `AGENTMEMORY_SUPPRESS_COST_WARNING=1` to silence once you've made an informed choice.
+
+The Codex subscription provider is not on this table: it bills against your ChatGPT plan rather than per token, and `AGENTMEMORY_CODEX_MODEL` is unset by default so the model comes from your own `~/.codex/config.toml`. What it costs instead is latency — ~27 s per `compress` against ~13 s for DeepSeek — plus your plan's own rate limits. See [Codex subscription provider](#codex-subscription-provider-agentmemory_codex).
 
 Quality vs cost tradeoff for memory work: compression is a summarization task with relatively loose quality bars (the agent re-reads the summary, not the user). DeepSeek-V4-Pro / Qwen3-Coder land within rounding error of Sonnet on this task while costing ~10× less. Save the premium-tier models for queries you read directly.
 
