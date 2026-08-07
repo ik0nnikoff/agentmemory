@@ -5,6 +5,7 @@ import type {
 } from "../types.js";
 import { AgentSDKProvider } from "./agent-sdk.js";
 import { AnthropicProvider } from "./anthropic.js";
+import { CODEX_DEFAULT_MODEL, CodexProvider } from "./codex.js";
 import { MinimaxProvider } from "./minimax.js";
 import { NoopProvider } from "./noop.js";
 import { OpenAIProvider } from "./openai.js";
@@ -48,11 +49,21 @@ function defaultModelFor(providerType: ProviderConfig["provider"]): string {
       return getEnvVar("MINIMAX_MODEL") || "MiniMax-M2.7";
     case "agent-sdk":
       return "claude-sonnet-4-20250514";
+    case "codex":
+      return getEnvVar("AGENTMEMORY_CODEX_MODEL") || CODEX_DEFAULT_MODEL;
     case "noop":
     default:
       return "noop";
   }
 }
+
+// Re-exported, NOT declared here. The sentinel is owned by the provider that
+// gives it meaning (`./codex.js`), so the dependency runs factory -> provider
+// like every other provider in this file. Declaring it here instead made
+// `codex.ts` import back from this module — the only provider that did — and
+// that cycle only stayed harmless while the constant happened to be read inside
+// a method body; a top-level read would have hit the ESM temporal dead zone.
+export { CODEX_DEFAULT_MODEL } from "./codex.js";
 
 export function createProvider(config: ProviderConfig): ResilientProvider {
   return new ResilientProvider(createBaseProvider(config));
@@ -145,6 +156,11 @@ function createBaseProvider(config: ProviderConfig): MemoryProvider {
     }
     case "noop":
       return new NoopProvider();
+    // Must stay ABOVE `agent-sdk`: that case shares the `default` branch and
+    // catches every unknown provider type, so a `codex` case placed after it
+    // is only reachable by accident of ordering.
+    case "codex":
+      return new CodexProvider(config);
     case "agent-sdk":
     default:
       return new AgentSDKProvider();

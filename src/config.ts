@@ -10,6 +10,17 @@ import type {
   ClaudeBridgeConfig,
   TeamConfig,
 } from "./types.js";
+// The codex default model is imported, never re-spelled: detectProvider() below
+// and defaultModelFor() in providers/index.ts must resolve the SAME string for
+// the codex provider (#778 — a fallback that disagrees with the primary calls
+// the provider with a foreign model name). Two literals would drift silently.
+//
+// This edge closes a cycle (`providers/codex.ts` imports getEnvVar from here),
+// and that is safe only because BOTH reads across it sit inside function
+// bodies: this module reads CODEX_DEFAULT_MODEL inside detectProvider(), and
+// codex.ts calls getEnvVar() inside methods. A top-level read on either side
+// would hit the ESM temporal dead zone — see the note at providers/index.ts:60.
+import { CODEX_DEFAULT_MODEL } from "./providers/codex.js";
 
 function safeParseInt(value: string | undefined, fallback: number): number {
   if (!value) return fallback;
@@ -157,12 +168,34 @@ function detectProvider(env: Record<string, string>): ProviderConfig {
     };
   }
 
+  // Second key-less path (ChatGPT subscription via `codex exec`). Opt-in only:
+  // there is no local way to learn whether a Codex session exists — the CLI
+  // finds out over the network and takes ~28 s to say "no" — so auto-detection
+  // would tax every start of every install that has no session.
+  //
+  // Position is load-bearing in both directions:
+  //   * BELOW every API-key branch, so an install that has a key keeps the
+  //     provider it had before this wave even with the flag set;
+  //   * ABOVE the AGENTMEMORY_ALLOW_AGENT_SDK gate, so when both key-less
+  //     opt-ins are on, codex wins. That tie has to be decided somewhere and
+  //     written down: "the provider returned text" looks identical coming from
+  //     Codex and from Claude via agent-sdk, so an undecided order would be
+  //     unobservable. test/config-provider-selection.test.ts pins both halves.
+  if (env["AGENTMEMORY_CODEX"] === "true") {
+    return {
+      provider: "codex",
+      model: env["AGENTMEMORY_CODEX_MODEL"] || CODEX_DEFAULT_MODEL,
+      maxTokens,
+    };
+  }
+
   const allowAgentSdk = env["AGENTMEMORY_ALLOW_AGENT_SDK"] === "true";
   if (!allowAgentSdk) {
     process.stderr.write(
       pc.dim(
         "[agentmemory] No LLM provider key set — running zero-LLM (BM25 + on-device embeddings). " +
           "Set ANTHROPIC_API_KEY (or GEMINI/OPENAI/OPENROUTER/MINIMAX) in ~/.agentmemory/.env for LLM compression and summaries. " +
+          "Key-less options: AGENTMEMORY_CODEX=true uses a ChatGPT subscription via the Codex CLI. " +
           "Agent-SDK fallback stays off by default to avoid a Stop-hook recursion loop; opt in with AGENTMEMORY_AUTO_COMPRESS=true + AGENTMEMORY_ALLOW_AGENT_SDK=true.\n",
       ),
     );
@@ -243,6 +276,16 @@ export function detectLlmProviderKind(): "llm" | "noop" {
     (hasRealValue(env["OPENAI_API_KEY"]) &&
       env["OPENAI_API_KEY_FOR_LLM"] !== "false")
   ) {
+    return "llm";
+  }
+  // Key-less opt-in, so no key check above can see it. This function is the
+  // second, parallel chain over the same env names as detectProvider(); its
+  // answer is what GET /agentmemory/config/flags reports as `provider`
+  // (triggers/api.ts:183), and the dashboard pairs it with each flag's
+  // `needsLlm` to decide whether an LLM feature is reachable. Omitting codex
+  // here would leave an install compressing through Codex while its own UI
+  // said there is no LLM.
+  if (env["AGENTMEMORY_CODEX"] === "true") {
     return "llm";
   }
   return "noop";
@@ -476,6 +519,9 @@ export function getStandalonePersistPath(): string {
   );
 }
 
+// Legal targets of FALLBACK_PROVIDERS. Every ProviderType except `noop`, which
+// is meaningless as a fallback target (it never fails, so it would swallow the
+// rest of the chain).
 const VALID_PROVIDERS = new Set([
   "anthropic",
   "gemini",
@@ -483,6 +529,7 @@ const VALID_PROVIDERS = new Set([
   "agent-sdk",
   "minimax",
   "openai",
+  "codex",
 ]);
 
 export function loadFallbackConfig(): FallbackConfig {
