@@ -1262,3 +1262,65 @@ describe("CodexProvider authorization and installation diagnosis", () => {
     expect(linesWith(capture.lines, AUTH_MARK).length).toBe(1);
   });
 });
+
+// The second throughput lever, and the proof that it REACHES the SDK rather
+// than the claim that it does: the assertions are on the ThreadOptions the SDK
+// was handed, not on the outcome of the call — the turn succeeds either way.
+//
+// The effort values below are invented; validating them against the catalogue
+// of the selected model is the CLI's job (Р-1), not the provider's.
+const EFFORT_ENV = "AGENTMEMORY_CODEX_REASONING_EFFORT";
+
+describe("CodexProvider reasoning effort", () => {
+  beforeEach(() => {
+    resetState();
+    delete process.env[EFFORT_ENV];
+  });
+
+  afterEach(() => {
+    delete process.env[EFFORT_ENV];
+  });
+
+  it("passes AGENTMEMORY_CODEX_REASONING_EFFORT through to ThreadOptions (§6.7)", async () => {
+    process.env[EFFORT_ENV] = "made-up-effort";
+
+    await newProvider().compress("sys", "user");
+
+    expect(state.threadOptions.length).toBe(1);
+    expect(state.threadOptions[0].modelReasoningEffort).toBe("made-up-effort");
+  });
+
+  it("omits the KEY ENTIRELY when the variable is not set (§6.7)", async () => {
+    await newProvider().compress("sys", "user");
+
+    const options = state.threadOptions[0];
+    // Not `toBeUndefined()`: an explicitly present `modelReasoningEffort:
+    // undefined` would pass that and would still be serialized by the SDK as a
+    // supplied option. The absence of the key is the assertion.
+    expect(Object.prototype.hasOwnProperty.call(options, "modelReasoningEffort")).toBe(false);
+    expect(Object.keys(options)).not.toContain("modelReasoningEffort");
+  });
+
+  it("treats an empty or blank value as not set", async () => {
+    process.env[EFFORT_ENV] = "   ";
+
+    await newProvider().summarize("sys", "user");
+
+    expect(
+      Object.prototype.hasOwnProperty.call(state.threadOptions[0], "modelReasoningEffort"),
+    ).toBe(false);
+  });
+
+  it("carries the value on every turn, not only the first", async () => {
+    process.env[EFFORT_ENV] = "another-effort";
+    const provider = newProvider();
+
+    await provider.compress("sys", "a");
+    await provider.summarize("sys", "b");
+
+    expect(state.threadOptions.length).toBe(2);
+    for (const options of state.threadOptions) {
+      expect(options.modelReasoningEffort).toBe("another-effort");
+    }
+  });
+});

@@ -136,6 +136,27 @@ function parseOptionalPositiveInt(value: unknown): number | undefined | null {
   return parsed;
 }
 
+/**
+ * The name of the provider instance this process is actually running, with the
+ * resilience decorator peeled off: every provider is wrapped in
+ * `ResilientProvider`, whose own name is `resilient(<inner>)`
+ * (`src/providers/resilient.ts:9`), and that wrapper is a circuit breaker, not
+ * an identity. A fallback chain keeps its full name (`fallback(a -> b)`) —
+ * there the composition IS the identity.
+ *
+ * `"unknown"` when the API layer was constructed without a provider, which is
+ * a test-only shape today (`src/index.ts:397` always passes one).
+ */
+function liveProviderName(provider: unknown): string {
+  const name =
+    typeof provider === "object" && provider !== null && "name" in provider
+      ? (provider as { name?: unknown }).name
+      : undefined;
+  if (typeof name !== "string" || name === "") return "unknown";
+  const unwrapped = name.match(/^resilient\((.*)\)$/);
+  return unwrapped?.[1] ?? name;
+}
+
 export function registerApiTriggers(
   sdk: ISdk,
   kv: StateKV,
@@ -233,6 +254,16 @@ export function registerApiTriggers(
         body: {
           version: VERSION,
           provider: providerKind,
+          // The NAME of the provider this running process actually built, next
+          // to the llm/noop kind above. `agentmemory codex status` needs it to
+          // answer "what does the running daemon use", which the kind cannot
+          // say: every keyed provider and codex alike report `llm`. Read off
+          // the live instance rather than re-derived from the environment,
+          // because the daemon memoizes `~/.agentmemory/.env` at boot
+          // (`src/config.ts:36-45`) — a re-derivation would answer for the file
+          // as it is NOW, which is precisely the difference the CLI prints as
+          // two separate lines.
+          llmProvider: liveProviderName(provider),
           embeddingProvider,
           flags,
         },

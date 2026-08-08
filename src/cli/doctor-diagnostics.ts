@@ -16,6 +16,12 @@
 //   agentmemory doctor --all       # apply every available fix without prompting (CI)
 //   agentmemory doctor --dry-run   # show what each fix WOULD do; execute nothing
 
+// The ONLY import of this module, and it is deliberate: the parser of
+// ~/.agentmemory/.env must be the daemon's own, not a copy. Everything else
+// here stays dependency-free so the diagnostics can be unit-tested without
+// dragging @clack/prompts into the harness.
+import { parseEnvFileContent } from "../config.js";
+
 export type DiagnosticStatus = {
   ok: boolean;
   /** Short status detail (one line). Shown alongside the check name. */
@@ -95,25 +101,20 @@ const PROVIDER_KEY_NAMES = [
   "MINIMAX_API_KEY",
 ] as const;
 
+/**
+ * Reads `~/.agentmemory/.env` — by delegating to the ONE parser of that file,
+ * `parseEnvFileContent` (`src/config.ts`), which is the grammar the daemon
+ * itself applies.
+ *
+ * 🔴 This used to be a second, separate implementation, and the two disagreed: this
+ * one stripped surrounding quotes only, so `KEY=false   # note` yielded
+ * `"false   # note"` here and `"false"` in the daemon. Anything comparing the
+ * result against a literal then answered differently depending on which parser
+ * it happened to call. The name is kept because callers use it; the body must
+ * stay a delegation — a second grammar is the defect itself.
+ */
 export function parseEnvFile(content: string): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const rawLine of content.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#")) continue;
-    const eq = line.indexOf("=");
-    if (eq < 0) continue;
-    const key = line.slice(0, eq).trim();
-    let value = line.slice(eq + 1).trim();
-    // Strip surrounding quotes.
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
-    }
-    out[key] = value;
-  }
-  return out;
+  return parseEnvFileContent(content);
 }
 
 /** Returns the list of provider keys that look real (non-placeholder). */
@@ -335,6 +336,50 @@ export function buildDiagnostics(effects: DoctorEffects): Diagnostic[] {
         })),
     },
   ];
+}
+
+// Codex session — informational line, not a fix-catalog diagnostic (no fix to
+// apply here: `agentmemory codex login` is interactive and out of scope for
+// an auto-fix). Kept as a pure function, same reason as everything above it:
+// unit tests assert on shape without spawning the real `codex` binary or
+// bringing @clack/prompts into the harness.
+export type CodexSessionDoctorInput = {
+  /** `AGENTMEMORY_CODEX` read from the MERGED environment (.env file +
+   * process.env) — the same precedence `detectProvider()` uses
+   * (src/config.ts:184). */
+  codexEnabled: boolean;
+  /** `codexLoginStatus()` result (src/cli/codex-session.ts) — decided by the
+   * child's exit code, its stdout/stderr is never read. */
+  session:
+    | { state: "logged-in" | "logged-out" }
+    | { state: "error"; reason: string };
+  /** The directory actually checked: `CODEX_HOME` if set, else `~/.codex`. */
+  codexHome: string;
+};
+
+export function codexSessionDoctorCheck(
+  input: CodexSessionDoctorInput,
+): { name: string; ok: boolean; hint?: string } | undefined {
+  // Shown ONLY when Codex is the configured provider — the other ~99% of
+  // installs don't use it and this line would just be noise for them.
+  if (!input.codexEnabled) return undefined;
+
+  const { session, codexHome } = input;
+  if (session.state === "error") {
+    return {
+      name: "Codex session",
+      ok: false,
+      hint: `Could not check (${session.reason}). CODEX_HOME=${codexHome}`,
+    };
+  }
+  const loggedIn = session.state === "logged-in";
+  return {
+    name: "Codex session",
+    ok: loggedIn,
+    hint: loggedIn
+      ? `CODEX_HOME=${codexHome}`
+      : `Not logged in. CODEX_HOME=${codexHome}. Run: agentmemory codex login`,
+  };
 }
 
 export type DoctorRunMode = "interactive" | "all" | "dry-run";

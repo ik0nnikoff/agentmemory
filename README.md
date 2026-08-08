@@ -1239,12 +1239,25 @@ Compression and summarization run on your ChatGPT/Codex subscription instead of 
 |----------|---------|--------------|
 | `AGENTMEMORY_CODEX` | unset | `true` selects the provider |
 | `AGENTMEMORY_CODEX_MODEL` | unset | Unset → Codex picks the model from your own `~/.codex/config.toml`. Any value set here is passed to Codex as-is. |
+| `AGENTMEMORY_CODEX_REASONING_EFFORT` | unset | Unset → Codex picks the default effort for the selected model. Allowed values depend on the model — list them with `agentmemory codex effort`. |
 | `AGENTMEMORY_CODEX_TIMEOUT_MS` | `90000` | Per-call timeout |
 | `AGENTMEMORY_CODEX_MAX_CONCURRENCY` | `1` | Cap on simultaneous `codex exec` children |
 
 **It never overrides a configured API key.** The branch sits below every keyed provider and above `AGENTMEMORY_ALLOW_AGENT_SDK`, so an installation that already has a key keeps the provider it had. When both key-less flags are set (`AGENTMEMORY_CODEX=true` and `AGENTMEMORY_ALLOW_AGENT_SDK=true`), `codex` wins.
 
-**It requires an active Codex session.** There is no local "am I logged in?" check: the CLI finds out over the network. A missing session therefore surfaces as HTTP 401 from `api.openai.com` after roughly 28 seconds, not as an immediate startup error.
+**Signing in, checking the session, and steering model/effort go through `agentmemory codex …`:**
+
+```
+agentmemory codex status               # session + AGENTMEMORY_CODEX (file vs. running daemon) + model + effort
+agentmemory codex login / logout       # interactive sign-in / sign-out, stdio inherited
+agentmemory codex enable / disable     # writes AGENTMEMORY_CODEX=true|false to ~/.agentmemory/.env
+agentmemory codex model [<name>]       # list Codex's model catalogue, or pin AGENTMEMORY_CODEX_MODEL
+agentmemory codex effort [<level>]     # list efforts for the CURRENT model, or pin AGENTMEMORY_CODEX_REASONING_EFFORT
+```
+
+Exit codes are the same across every subcommand: `0` success/yes, `1` a valid negative answer (`status`: no session), `2` a usage error (unknown subcommand, unknown model, unsupported effort — nothing is written), `3` an environment error (binary not found, catalogue unreachable, `.env` not writable).
+
+**`agentmemory codex status` checks the session locally — no 28-second network wait.** It runs `codex login status` and decides by the child's exit code alone (never by reading its output), which answers in well under a second with no network call. A session-less install still fails a *live* `codex exec` call the same as before: that failure surfaces as HTTP 401 from `api.openai.com` after roughly 28 seconds. `agentmemory codex status` exists precisely so you find that out beforehand instead of the hard way.
 
 **Latency is higher than the API providers, and that is expected.** Measured on real prompts: a compress-shaped prompt took **27 372 ms**, a summarize-shaped one **21 757 ms**. DeepSeek on the same compress shape took **12 902 ms**. So `compress` runs about twice as slow — that is the normal operating point of this provider, not a failure signal.
 

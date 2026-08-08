@@ -40,6 +40,7 @@ const c = {
 import { generateId } from "./state/schema.js";
 import {
   buildDiagnostics,
+  codexSessionDoctorCheck,
   dryRunPlan,
   parseEnvFile,
   type Diagnostic,
@@ -58,7 +59,7 @@ import { renderSplash } from "./cli/splash.js";
 import { isFirstRun, readPrefs, resetPrefs, writePrefs } from "./cli/preferences.js";
 import { runOnboarding } from "./cli/onboarding.js";
 import { setBootVerbose } from "./logger.js";
-import { hydrateProcessEnvFromFile } from "./config.js";
+import { getEnvVar, hydrateProcessEnvFromFile } from "./config.js";
 import { VERSION } from "./version.js";
 import { getAllTools, ESSENTIAL_TOOLS } from "./mcp/tools-registry.js";
 import { knownAgents } from "./cli/connect/index.js";
@@ -175,6 +176,17 @@ Commands:
                      No arg = interactive picker. --all wires every detected agent.
                      --dry-run shows what would change. --force re-installs.
   status             Show connection status, memory count, flags, and health
+  codex [sub]        Codex as the LLM provider: sign in and steer it.
+                     No arg = status. Subcommands:
+                       login | logout   interactive Codex sign-in / sign-out
+                       status           session, flag in .env, flag in the running
+                                        daemon, model, reasoning effort
+                       enable | disable set AGENTMEMORY_CODEX in ~/.agentmemory/.env
+                       model [<name>]   list the models Codex itself offers, or pin one
+                       effort [<level>] list the efforts of the current model, or pin one
+                     Exit codes: 0 ok · 1 no session · 2 usage (unknown subcommand,
+                     model or effort) · 3 environment (no Codex CLI, no catalogue,
+                     .env not writable)
   doctor             Interactive diagnostic + fixer. [F]ix · [S]kip · [?]more · [Q]uit
                      --all: apply every fix without prompting (CI)
                      --dry-run: show what each fix would do, don't execute
@@ -1787,6 +1799,26 @@ async function passiveServerChecks(): Promise<DoctorCheck[]> {
       ? undefined
       : `Start with: npx @agentmemory/agentmemory (tried ${base})`,
   });
+
+  // Codex session: local-only (spawnSync, ~0.19s, no network — see
+  // codex-session.ts), so it runs regardless of `serverUp`. Gated on
+  // AGENTMEMORY_CODEX in the MERGED environment (.env file + process.env,
+  // same precedence detectProvider() uses) so the ~99% of installs that
+  // don't use Codex see no line at all.
+  if (getEnvVar("AGENTMEMORY_CODEX") === "true") {
+    const { codexLoginStatus } = await import("./cli/codex-session.js");
+    // CODEX_HOME is printed because a LaunchAgent-run daemon can have a
+    // different HOME than this CLI invocation — without naming the checked
+    // directory the diagnostic would silently disagree with itself.
+    const codexHome = process.env["CODEX_HOME"] || join(homedir(), ".codex");
+    const codexCheck = codexSessionDoctorCheck({
+      codexEnabled: true,
+      session: codexLoginStatus(),
+      codexHome,
+    });
+    if (codexCheck) checks.push(codexCheck);
+  }
+
   if (!serverUp) return checks;
 
   const [health, flags, graph] = await Promise.all([
@@ -3067,6 +3099,13 @@ const commands: Record<string, () => Promise<void>> = {
   remove: runRemove,
   mcp: runMcp,
   "import-jsonl": runImportJsonl,
+  // Dynamic, like `connect` above: the codex command pulls in the Codex
+  // provider (for the child-env allowlist) and the SDK types, and no other
+  // invocation of this CLI needs them loaded.
+  codex: async () => {
+    const { runCodexCmd } = await import("./cli/codex.js");
+    await runCodexCmd(args.slice(1));
+  },
 };
 
 const first = args[0] ?? "";

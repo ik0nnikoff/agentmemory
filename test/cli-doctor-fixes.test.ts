@@ -8,6 +8,7 @@
 import { describe, it, expect } from "vitest";
 import {
   buildDiagnostics,
+  codexSessionDoctorCheck,
   DIAGNOSTIC_IDS,
   dryRunPlan,
   parseEnvFile,
@@ -235,5 +236,51 @@ describe("realProviderKeys / placeholderProviderKeys", () => {
     expect(placeholderProviderKeys({ ANTHROPIC_API_KEY: "xxxx-xxxx" })).toEqual([
       "ANTHROPIC_API_KEY",
     ]);
+  });
+});
+
+describe("codexSessionDoctorCheck", () => {
+  it("is absent when AGENTMEMORY_CODEX is not enabled", () => {
+    expect(
+      codexSessionDoctorCheck({
+        codexEnabled: false,
+        session: { state: "logged-in" },
+        codexHome: "/home/x/.codex",
+      }),
+    ).toBeUndefined();
+  });
+
+  it("reports ok with the checked CODEX_HOME when logged in", () => {
+    const check = codexSessionDoctorCheck({
+      codexEnabled: true,
+      session: { state: "logged-in" },
+      codexHome: "/home/x/.codex",
+    });
+    expect(check).toEqual({
+      name: "Codex session",
+      ok: true,
+      hint: "CODEX_HOME=/home/x/.codex",
+    });
+  });
+
+  it("reports not-ok with a login hint when logged out", () => {
+    const check = codexSessionDoctorCheck({
+      codexEnabled: true,
+      session: { state: "logged-out" },
+      codexHome: "/home/x/.codex",
+    });
+    expect(check?.ok).toBe(false);
+    expect(check?.hint).toContain("agentmemory codex login");
+    expect(check?.hint).toContain("/home/x/.codex");
+  });
+
+  it("reports not-ok with the diagnosed reason on error, never the child's output", () => {
+    const check = codexSessionDoctorCheck({
+      codexEnabled: true,
+      session: { state: "error", reason: "codex login status timed out after 10000 ms" },
+      codexHome: "/home/x/.codex",
+    });
+    expect(check?.ok).toBe(false);
+    expect(check?.hint).toContain("timed out after 10000 ms");
   });
 });

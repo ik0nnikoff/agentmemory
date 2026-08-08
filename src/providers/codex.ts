@@ -55,7 +55,7 @@ export const CODEX_DEFAULT_MODEL = "codex-default";
  * the network at all behind a corporate proxy, and the failure would surface as
  * an opaque timeout.
  */
-const CHILD_ENV_ALLOWLIST: readonly string[] = [
+export const CHILD_ENV_ALLOWLIST: readonly string[] = [
   // Binary lookup and shell resolution. The SDK prepends its own bundled
   // directories to whichever of these keys exists (`dist/index.js:474-492`).
   "PATH",
@@ -1020,6 +1020,24 @@ export class CodexProvider implements MemoryProvider {
     // instead of being handed a literal their plan may not include.
     if (this.model !== CODEX_DEFAULT_MODEL) {
       options.model = this.model;
+    }
+    // Reasoning effort is the second throughput lever after the model, and it
+    // is opt-in: with the variable unset the KEY IS ABSENT from the options
+    // (not present-and-undefined), so Codex resolves the effort from the
+    // operator's own ~/.codex/config.toml exactly as before this line existed.
+    //
+    // The cast is not a shortcut, it is the decision of Р-1: the SDK's
+    // `ModelReasoningEffort` union (`@openai/codex-sdk/dist/index.d.ts:239`)
+    // lists minimal|low|medium|high|xhigh — it lacks `max` and `ultra`, which
+    // the model catalogue declares as supported and which already stand in
+    // real config.toml files, and it offers `minimal`, which no model in the
+    // catalogue offers. The SDK's runtime does not check the union either: it
+    // forwards the string as `--config model_reasoning_effort="<v>"`
+    // (`dist/index.js:206-207`). The validator is the CLI, against the
+    // catalogue of the selected model (`src/cli/codex.ts`, `codexEffort`).
+    const effort = getEnvVar("AGENTMEMORY_CODEX_REASONING_EFFORT")?.trim();
+    if (effort) {
+      options.modelReasoningEffort = effort as ThreadOptions["modelReasoningEffort"];
     }
     return options;
   }

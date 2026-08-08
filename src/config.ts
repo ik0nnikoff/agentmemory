@@ -41,14 +41,31 @@ let warnPremiumModelShown = false;
 // call __resetEnvFileCache().
 let envFileCache: Record<string, string> | undefined;
 
-function loadEnvFile(): Record<string, string> {
-  if (envFileCache) return envFileCache;
-  if (!existsSync(ENV_FILE)) {
-    envFileCache = {};
-    return envFileCache;
-  }
-  const content = readFileSync(ENV_FILE, "utf-8");
+/**
+ * THE parser of `~/.agentmemory/.env`. Pure, no I/O — every reader of that file
+ * must go through this function, including the CLI.
+ *
+ * 🔴 It exists because there were two of them. `parseEnvFile()` in
+ * `src/cli/doctor-diagnostics.ts` used to strip only surrounding quotes and
+ * kept an inline comment inside the value, so a line the daemon reads as
+ * `false` was read by the CLI as `false                   # LLM OFF …`. The two
+ * answers were then compared against the same literals, and every such
+ * comparison silently went the other way — e.g. `agentmemory codex enable`
+ * warning that `OPENAI_API_KEY_FOR_LLM` is not "false" on a file where it is.
+ * A second implementation of one file's grammar is the defect, so the grammar
+ * lives here once and `doctor-diagnostics.ts` delegates to it.
+ *
+ * The grammar is unchanged from what the daemon has always applied:
+ *   - a line whose first non-blank character is `#` is a comment;
+ *   - `KEY=value` splits on the FIRST `=`;
+ *   - a quoted value is the content between the quotes (an unterminated quote
+ *     is left as written, quote and all);
+ *   - an unquoted value ends at the first ` #`, and the remainder is trimmed.
+ */
+export function parseEnvFileContent(content: string): Record<string, string> {
   const vars: Record<string, string> = {};
+  // Split on "\n" only: the per-line `trim()` below removes a trailing "\r",
+  // so CRLF files parse identically without a second code path.
   for (const line of content.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
@@ -66,7 +83,16 @@ function loadEnvFile(): Record<string, string> {
     }
     vars[key] = val;
   }
-  envFileCache = vars;
+  return vars;
+}
+
+function loadEnvFile(): Record<string, string> {
+  if (envFileCache) return envFileCache;
+  if (!existsSync(ENV_FILE)) {
+    envFileCache = {};
+    return envFileCache;
+  }
+  envFileCache = parseEnvFileContent(readFileSync(ENV_FILE, "utf-8"));
   return envFileCache;
 }
 
@@ -168,10 +194,13 @@ function detectProvider(env: Record<string, string>): ProviderConfig {
     };
   }
 
-  // Second key-less path (ChatGPT subscription via `codex exec`). Opt-in only:
-  // there is no local way to learn whether a Codex session exists — the CLI
-  // finds out over the network and takes ~28 s to say "no" — so auto-detection
-  // would tax every start of every install that has no session.
+  // Second key-less path (ChatGPT subscription via `codex exec`). Opt-in
+  // only: `codex login status` (agentmemory codex status) answers locally in
+  // ~0.19 s and needs no network, but running it is still a spawned child
+  // process on EVERY start — auto-detecting a session that way would tax
+  // every start of every install, including the ones that never touch
+  // Codex, and would silently switch a fresh install's provider onto Codex
+  // the moment its operator happened to be logged in for something else.
   //
   // Position is load-bearing in both directions:
   //   * BELOW every API-key branch, so an install that has a key keeps the
